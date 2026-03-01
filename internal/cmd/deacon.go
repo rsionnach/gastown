@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -264,6 +265,25 @@ Example:
 	RunE: runDeaconCleanupOrphans,
 }
 
+var deaconQualityTrendsCmd = &cobra.Command{
+	Use:   "quality-trends",
+	Short: "Show quality review trends from Guardian judgments",
+	Long: `Analyze quality review trends per worker from Guardian judgment data.
+
+Reads the Guardian judgment state file and computes per-worker quality
+metrics within a configurable time window: average score, rejection rate,
+status (OK/WARN/BREACH), and trend direction (improving/stable/declining).
+
+Workers are sorted by average score ascending (worst first).
+
+Examples:
+  gt deacon quality-trends                  # Default 24h window
+  gt deacon quality-trends --window=7d      # Last 7 days
+  gt deacon quality-trends --window=2h      # Last 2 hours
+  gt deacon quality-trends --json           # Machine-readable output`,
+	RunE: runDeaconQualityTrends,
+}
+
 var (
 	triggerTimeout time.Duration
 
@@ -282,6 +302,10 @@ var (
 
 	// Pause flags
 	pauseReason string
+
+	// Quality trends flags
+	qualityTrendsWindow string
+	qualityTrendsJSON   bool
 )
 
 func init() {
@@ -299,6 +323,11 @@ func init() {
 	deaconCmd.AddCommand(deaconPauseCmd)
 	deaconCmd.AddCommand(deaconResumeCmd)
 	deaconCmd.AddCommand(deaconCleanupOrphansCmd)
+	deaconCmd.AddCommand(deaconQualityTrendsCmd)
+
+	// Flags for quality-trends
+	deaconQualityTrendsCmd.Flags().StringVar(&qualityTrendsWindow, "window", "", "Time window (e.g., 7d, 24h, 2h30m; default: 24h)")
+	deaconQualityTrendsCmd.Flags().BoolVar(&qualityTrendsJSON, "json", false, "Output as JSON")
 
 	// Flags for trigger-pending
 	deaconTriggerPendingCmd.Flags().DurationVar(&triggerTimeout, "timeout", 2*time.Second,
@@ -1184,4 +1213,108 @@ func runDeaconCleanupOrphans(cmd *cobra.Command, args []string) error {
 	}
 
 	return nil
+}
+
+// runDeaconQualityTrends shows quality review trends from Guardian judgments.
+func runDeaconQualityTrends(cmd *cobra.Command, args []string) error {
+	townRoot, err := workspace.FindFromCwdOrError()
+	if err != nil {
+		return fmt.Errorf("not in a Gas Town workspace: %w", err)
+	}
+
+	window, err := parseTrendWindow(qualityTrendsWindow)
+	if err != nil {
+		return err
+	}
+
+	cfg := &deacon.TrendConfig{Window: window}
+	result, err := deacon.ScanTrends(townRoot, cfg)
+	if err != nil {
+		return fmt.Errorf("scanning quality trends: %w", err)
+	}
+
+	if qualityTrendsJSON {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(result)
+	}
+
+	if result.TotalWorkers == 0 {
+		fmt.Printf("%s No judgment data found in window (%s)\n",
+			style.Dim.Render("○"), window)
+		return nil
+	}
+
+	fmt.Printf("%s Quality Trends (%d workers, window: %s)\n\n",
+		style.Bold.Render("●"), result.TotalWorkers, window)
+
+	if result.BreachCount > 0 {
+		fmt.Printf("  %s %d BREACH  ", style.Bold.Render("✗"), result.BreachCount)
+	}
+	if result.WarnCount > 0 {
+		fmt.Printf("  %s %d WARN  ", style.Dim.Render("⚠"), result.WarnCount)
+	}
+	okCount := result.TotalWorkers - result.BreachCount - result.WarnCount
+	if okCount > 0 {
+		fmt.Printf("  %s %d OK", style.Bold.Render("✓"), okCount)
+	}
+	fmt.Println()
+	fmt.Println()
+
+	// Table header.
+	fmt.Printf("%-20s %7s %6s %10s %8s %10s\n",
+		"WORKER", "REVIEWS", "AVG", "REJECT%", "STATUS", "TREND")
+	fmt.Printf("%-20s %7s %6s %10s %8s %10s\n",
+		"─────────────────", "───────", "─────", "──────────", "────────", "──────────")
+
+	for _, w := range result.Workers {
+		fmt.Printf("%-20s %7d %6.2f %9.0f%% %8s %10s\n",
+			truncateDeacon(w.Worker, 20),
+			w.ReviewCount,
+			w.AvgScore,
+			w.RejectionRate*100,
+			w.Status,
+			w.Trend)
+	}
+
+	return nil
+}
+
+// truncateDeacon truncates a string to maxLen, adding "…" if needed.
+func truncateDeacon(s string, maxLen int) string {
+	r := []rune(s)
+	if len(r) <= maxLen {
+		return s
+	}
+	return string(r[:maxLen-1]) + "…"
+}
+
+// parseTrendWindow parses a window flag value into a Duration.
+// Supports "Nd" day suffix and standard Go durations. Defaults to 24h if empty.
+func parseTrendWindow(window string) (time.Duration, error) {
+	if window == "" {
+		return 24 * time.Hour, nil
+	}
+
+	// Check for day suffix (e.g., "7d").
+	if strings.HasSuffix(window, "d") {
+		dayStr := strings.TrimSuffix(window, "d")
+		days, err := strconv.Atoi(dayStr)
+		if err != nil {
+			return 0, fmt.Errorf("invalid window %q: day values must be integers", window)
+		}
+		if days <= 0 {
+			return 0, fmt.Errorf("invalid window %q: must be positive", window)
+		}
+		return time.Duration(days) * 24 * time.Hour, nil
+	}
+
+	d, err := time.ParseDuration(window)
+	if err != nil {
+		return 0, fmt.Errorf("invalid window %q: %w", window, err)
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf("invalid window %q: must be positive", window)
+	}
+	return d, nil
 }
